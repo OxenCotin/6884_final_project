@@ -20,8 +20,9 @@ full_data = "scan/SCAN-master/tasks.txt"
 INPUT_LANG, OUTPUT_LANG, full_pairs = prepareData('scan_in', 'scan_out', full_data, False)
 # used for train as well as test splits
 # I add one for the <EOS> tag. Not sure if necessary but can't hurt.
+INPUT_MAX = 10
 MAX_LENGTH = max(len(pair[1].split(' ')) for pair in full_pairs) + 1
-
+BATCH_SIZE = 64
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print('Torch device: {}'.format(DEVICE))
 
@@ -60,11 +61,25 @@ def tensorFromSentence(lang, sentence, device):
     indices.append(EOS_token)
     return torch.tensor(indices, dtype=torch.long, device=device).view(-1, 1)
 
+def tensorFromSentencePadded(lang, sentence, device, max_length=MAX_LENGTH):
+    indices = indicesFromSentence(lang, sentence)
+    indices.append(EOS_token)
+    indices.extend([PAD_token] * (max_length - len(indices)))
+    return torch.tensor(indices, dtype=torch.long, device=device).view(-1, 1)
+
 
 def tensorsFromPair(input_lang, output_lang, pair, device):
     input_tensor = tensorFromSentence(input_lang, pair[0], device)
     target_tensor = tensorFromSentence(output_lang, pair[1], device)
     return (input_tensor, target_tensor)
+
+def tensorsFromPairs(input_lang, output_lang, pairs, device):
+    tensors = []
+    for pair in pairs:
+        input_tensor = tensorFromSentencePadded(input_lang, pair[0], device)
+        target_tensor = tensorFromSentencePadded(output_lang, pair[1], device)
+        tensors.append((input_tensor, target_tensor))
+    return tensors
 
 
 """
@@ -83,15 +98,15 @@ class EncoderRNN(nn.Module):
         self.rnn = nn.GRU(hidden_size, hidden_size)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, input, hidden):
+    def forward(self, input, hidden, batch_size=1):
         # pdb.set_trace()
-        embedded = self.dropout(self.embedding(input).view(1, 1, -1))
+        embedded = self.dropout(self.embedding(input).view(1, batch_size, -1))
         output = embedded
         output, hidden = self.rnn(output, hidden)
         return output, hidden
 
-    def initHidden(self):
-        return torch.zeros(1, 1, self.hidden_size, device=self.device)
+    def initHidden(self, batch_size=1):
+        return torch.zeros(1, batch_size, self.hidden_size, device=self.device)
 
 
 class DecoderRNN(nn.Module):
@@ -106,15 +121,16 @@ class DecoderRNN(nn.Module):
         self.softmax = nn.LogSoftmax(dim=1)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, input, hidden):
-        output = self.dropout(self.embedding(input).view(1, 1, -1))
+    def forward(self, input, hidden, batch_size=1):
+        output = self.dropout(self.embedding(input).view(1, batch_size, -1))
         output = F.relu(output)
+        pdb.set_trace()
         output, hidden = self.rnn(output, hidden)
         output = self.softmax(self.out(output[0]))
         return output, hidden
 
-    def initHidden(self):
-        return torch.zeros(1, 1, self.hidden_size, device=self.device)
+    def initHidden(self, batch_size=1):
+        return torch.zeros(1, batch_size, self.hidden_size, device=self.device)
 
 
 class EncoderLSTM(nn.Module):
@@ -128,15 +144,15 @@ class EncoderLSTM(nn.Module):
         self.rnn = nn.LSTM(hidden_size, hidden_size, n_layers)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, input, hidden, cell):
+    def forward(self, input, hidden, cell, batch_size=1):
         # pdb.set_trace()
         embedded = self.dropout(self.embedding(input).view(1, 1, -1))
         output = embedded
         output, (hidden, cell) = self.rnn(output, (hidden, cell))
         return output, (hidden, cell)
 
-    def initHidden(self):
-        return (torch.zeros(self.n_layers, 1, self.hidden_size, device=self.device), torch.zeros(self.n_layers, 1, self.hidden_size, device=self.device))
+    def initHidden(self, batch_size=1):
+        return (torch.zeros(self.n_layers, batch_size, self.hidden_size, device=self.device), torch.zeros(self.n_layers, batch_size, self.hidden_size, device=self.device))
 
 
 class DecoderLSTM(nn.Module):
@@ -151,15 +167,15 @@ class DecoderLSTM(nn.Module):
         # self.softmax = nn.LogSoftmax(dim=1)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, input, hidden, cell):
-        output = self.dropout(self.embedding(input).view(1, 1, -1))
+    def forward(self, input, hidden, cell, batch_size=1):
+        output = self.dropout(self.embedding(input).view(1, batch_size, -1))
         output = F.relu(output)
         output, (hidden, cell) = self.rnn(output, (hidden, cell))
-        output = self.out(output[0])
+        output = self.out(output.squeeze(0))
         return output, (hidden, cell)
 
-    def initHidden(self):
-        return (torch.zeros(self.n_layers, 1, self.hidden_size, device=self.device), torch.zeros(self.n_layers, 1, self.hidden_size, device=self.device))
+    def initHidden(self, batch_size=1):
+        return (torch.zeros(self.n_layers, batch_size, self.hidden_size, device=self.device), torch.zeros(self.n_layers, batch_size, self.hidden_size, device=self.device))
 
 class AttnDecoderRNN(nn.Module):
     def __init__(self, device, hidden_size, output_size, dropout_p=0.1, max_length=MAX_LENGTH):
@@ -177,8 +193,8 @@ class AttnDecoderRNN(nn.Module):
         self.gru = nn.GRU(self.hidden_size, self.hidden_size)
         self.out = nn.Linear(self.hidden_size, self.output_size)
 
-    def forward(self, input, hidden, encoder_outputs):
-        embedded = self.embedding(input).view(1, 1, -1)
+    def forward(self, input, hidden, encoder_outputs, batch_size=1):
+        embedded = self.embedding(input).view(1, batch_size, -1)
         embedded = self.dropout(embedded)
 
         attn_weights = F.softmax(
@@ -195,8 +211,8 @@ class AttnDecoderRNN(nn.Module):
         output = F.log_softmax(self.out(output[0]), dim=1)
         return output, hidden, attn_weights
 
-    def initHidden(self):
-        return torch.zeros(1, 1, self.hidden_size, device=self.device)
+    def initHidden(self, batch_size=1):
+        return torch.zeros(1, batch_size, self.hidden_size, device=self.device)
 
 
 """
@@ -204,12 +220,12 @@ Training
 """
 
 def train(device, input_tensor, target_tensor, encoder, decoder, model, encoder_optimizer,
-        decoder_optimizer, criterion):
+        decoder_optimizer, criterion, batch_size=1):
 
     gradient_clip = 5
     teacher_forcing_ratio = 0.5
 
-    encoder_hidden = encoder.initHidden()
+    encoder_hidden = encoder.initHidden(batch_size)
 
     encoder_optimizer.zero_grad()
     decoder_optimizer.zero_grad()
@@ -217,37 +233,41 @@ def train(device, input_tensor, target_tensor, encoder, decoder, model, encoder_
     input_length = input_tensor.size(0)
     target_length = target_tensor.size(0)
 
-    encoder_outputs = torch.zeros(MAX_LENGTH, encoder.hidden_size, device=device)
+    encoder_outputs = torch.zeros(MAX_LENGTH, batch_size, encoder.hidden_size, device=device)
 
     loss = 0
-
+    
+    # pdb.set_trace()
     for ei in range(input_length):
         if model == "LSTM":
             encoder_output, encoder_hidden = encoder(
-                input_tensor[ei], *encoder_hidden)
+                input_tensor[ei], *encoder_hidden, batch_size)
         else:
             encoder_output, encoder_hidden = encoder(
-                input_tensor[ei], encoder_hidden)
+                input_tensor[ei], encoder_hidden, batch_size)
         encoder_outputs[ei] = encoder_output[0, 0]
 
-    decoder_input = torch.tensor([[SOS_token]], device=device)
+    pdb.set_trace()
+    decoder_input = torch.tensor([[SOS_token]*batch_size], device=device)
 
     decoder_hidden = encoder_hidden
 
     use_teacher_forcing = True if random.random() < teacher_forcing_ratio else False
-
+    # pdb.set_trace()
     if use_teacher_forcing:
         # Teacher forcing: Feed the target as the next input
         for di in range(target_length):
             if model == "LSTM":
                 decoder_output, decoder_hidden = decoder(
-                    decoder_input, *decoder_hidden)
+                    decoder_input, *decoder_hidden, batch_size)
             elif model == "GRU_A":
                 decoder_output, decoder_hidden, decoder_attention = decoder(
-                    decoder_input, decoder_hidden, encoder_outputs)
+                    decoder_input, decoder_hidden, encoder_outputs, batch_size)
             else:
+                pdb.set_trace()
                 decoder_output, decoder_hidden = decoder(
-                    decoder_input, decoder_hidden)
+                    decoder_input, decoder_hidden, batch_size)
+            pdb.set_trace()
             loss += criterion(decoder_output, target_tensor[di])
             decoder_input = target_tensor[di]  # Teacher forcing
 
@@ -262,7 +282,8 @@ def train(device, input_tensor, target_tensor, encoder, decoder, model, encoder_
                     decoder_input, decoder_hidden, encoder_outputs)
             else:
                 decoder_output, decoder_hidden = decoder(
-                    decoder_input, decoder_hidden)
+                    decoder_input, decoder_hidden, batch_size)
+            pdb.set_trace()
             topv, topi = decoder_output.topk(1)
             decoder_input = topi.squeeze().detach()  # detach from history as input
 
@@ -281,7 +302,7 @@ def train(device, input_tensor, target_tensor, encoder, decoder, model, encoder_
 
 
 def trainIters(device, encoder, decoder, model, pairs, n_iters, print_every=1000, plot_every=100,
-        learning_rate=0.001):
+        learning_rate=0.001, batch_size=1):
     print(f"Starting training: {n_iters} iterations")
     start = time.time()
     plot_losses = []
@@ -290,32 +311,36 @@ def trainIters(device, encoder, decoder, model, pairs, n_iters, print_every=1000
 
     encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
     decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate)
-    training_pairs = [tensorsFromPair(INPUT_LANG, OUTPUT_LANG, random.choice(pairs), device)
-                      for i in range(n_iters)]
+
     criterion = nn.NLLLoss()
 
-    evaluateRandomly(device, encoder, decoder, model, pairs, n = 100)
+    # evaluateRandomly(device, encoder, decoder, model, pairs, n = 1, batch_size=batch_size)
 
-    for iter in range(1, n_iters + 1):
+    for i in range(1, n_iters + 1):
+        pdb.set_trace()
         # print("iter")
-        training_pair = training_pairs[iter - 1]
-        input_tensor = training_pair[0]
-        target_tensor = training_pair[1]
-
+        if type(pairs) is torch.utils.data.DataLoader:
+            input_tensor, target_tensor = next(iter(pairs))
+            input_tensor = input_tensor.transpose(0, 1)
+            target_tensor = target_tensor.transpose(0, 1)
+        else:
+            training_pair = tensorsFromPair(INPUT_LANG, OUTPUT_LANG, random.choice(pairs), device)
+            input_tensor = training_pair[0]
+            target_tensor = training_pair[1]
         loss = train(device, input_tensor, target_tensor, encoder,
-                     decoder, model, encoder_optimizer, decoder_optimizer, criterion)
+                     decoder, model, encoder_optimizer, decoder_optimizer, criterion, batch_size=batch_size)
         print_loss_total += loss
         plot_loss_total += loss
 
-        if iter % print_every == 0:
+        if i % print_every == 0:
             print_loss_avg = print_loss_total / print_every
             print_loss_total = 0
-            print('Duration (Remaining): %s Iters: (%d %d%%) Loss avg: %.4f' % (timeSince(start, iter / n_iters),
-                                         iter, iter / n_iters * 100, print_loss_avg))
+            print('Duration (Remaining): %s Iters: (%d %d%%) Loss avg: %.4f' % (timeSince(start, i / n_iters),
+                                         i, i / n_iters * 100, print_loss_avg))
 
-            evaluateRandomly(device, encoder, decoder, model, pairs, n = 100)
+            evaluateRandomly(device, encoder, decoder, model, pairs, n = 1, batch_size=batch_size)
 
-        if iter % plot_every == 0:
+        if i % plot_every == 0:
             plot_loss_avg = plot_loss_total / plot_every
             plot_losses.append(plot_loss_avg)
             plot_loss_total = 0
@@ -378,7 +403,7 @@ def evaluate(device, encoder, decoder, model, sentence):
         return decoded_words
 
 
-def evaluateTestSet(device, encoder, decoder, model, pairs):
+def evaluateTestSet(device, encoder, decoder, model, pairs, batch_size=1):
     encoder.eval()
     decoder.eval()
 
@@ -405,28 +430,45 @@ def evaluateTestSet(device, encoder, decoder, model, pairs):
     return hits/len(pairs)
 
 
-
-def evaluateRandomly(device, encoder, decoder, model, pairs, n=10, verbose=False):
+def evaluateRandomly(device, encoder, decoder, model, pairs, n=10, verbose=False, batch_size=1):
     encoder.eval()
     decoder.eval()
 
     with torch.no_grad():
         hits = 0
         for i in range(n):
-            pair = random.choice(pairs)
-            if verbose:
-                print('>', pair[0])
-                print('=', pair[1])
-            output_words = evaluate(device, encoder, decoder, model, pair[0])
-            output_sentence = ' '.join(output_words)
-            if verbose:
-                print('<', output_sentence)
-            if output_words[-1] == '<EOS>':
-                output_sentence = ' '.join(output_words[:-1])
-                if pair[1] == output_sentence:
-                    hits += 1
-            if verbose:
-                print('')
+            if batch_size > 1:
+                pdb.set_trace()
+                pairs[0], pairs[1] = next(iter(pairs))
+                for pair in pairs:
+                    if verbose:
+                        print('>', pair[0])
+                        print('=', pair[1])
+                    output_words = evaluate(device, encoder, decoder, model, pair[0])
+                    output_sentence = ' '.join(output_words)
+                    if verbose:
+                        print('<', output_sentence)
+                    if output_words[-1] == '<EOS>':
+                        output_sentence = ' '.join(output_words[:-1])
+                        if pair[1] == output_sentence:
+                            hits += 1
+                    if verbose:
+                        print('')
+            else:
+                pair = random.choice(pairs)
+                if verbose:
+                    print('>', pair[0])
+                    print('=', pair[1])
+                output_words = evaluate(device, encoder, decoder, model, pair[0])
+                output_sentence = ' '.join(output_words)
+                if verbose:
+                    print('<', output_sentence)
+                if output_words[-1] == '<EOS>':
+                    output_sentence = ' '.join(output_words[:-1])
+                    if pair[1] == output_sentence:
+                        hits += 1
+                if verbose:
+                    print('')
 
     encoder.train()
     decoder.train()
@@ -461,14 +503,27 @@ def scanData(path):
     print('{} examples. Sample pair: {}'.format(len(pairs), random.choice(pairs)))
     return pairs
 
+def scanDataBatched(path, batch_size):
+    input_lang, out_lang, pairs = prepareData('scan_in', 'scan_out', path, False)
+    pairs = tensorsFromPairs(input_lang, out_lang, pairs, DEVICE)
+    rand_sampler = torch.utils.data.RandomSampler(pairs, num_samples=64, replacement=True)
+    batched = torch.utils.data.DataLoader(pairs, 
+        batch_size=batch_size, sampler=rand_sampler)
+    print('Loaded data from {}'.format(path))
+    print('{} examples. Sample pair: {}'.format(len(pairs), random.choice(pairs)))
+    return batched
 
-def trainTestSplit(device, encoder, decoder, model, train_path, test_path, iters=100000, count_every=1000):
+
+def trainTestSplit(device, encoder, decoder, model, train_path, test_path, iters=100000, count_every=1000, batch_size=BATCH_SIZE):
     train_path = 'scan/SCAN-master/' + train_path
     test_path = 'scan/SCAN-master/' + test_path
     train_pairs = scanData(train_path)
     test_pairs = scanData(test_path)
 
-    train_losses = trainIters(device, encoder, decoder, model, train_pairs, iters, count_every)
+    batched_train = scanDataBatched(train_path, batch_size)
+    batched_test = scanDataBatched(test_path, batch_size)
+
+    train_losses = trainIters(device, encoder, decoder, model, batched_train, iters, count_every, batch_size=batch_size)
     print('Evaluating training split accuracy')
     train_acc = evaluateTestSet(device, encoder, decoder, model, train_pairs)
     print('Evaluating test split accuracy')
@@ -521,13 +576,13 @@ if __name__ == '__main__':
     # model = 'GRU_A'
     # encoder, decoder = initModel('GRU_A', DEVICE, hidden_size=50, dropout=0.5)
 
-    model = 'LSTM'
-    encoder, decoder = initModel('LSTM', DEVICE, hidden_size=200, dropout=0.5, n_layers=2)
+    model = 'GRU'
+    encoder, decoder = initModel(model, DEVICE, hidden_size=200, dropout=0.5, n_layers=2)
 
     # checkpoint_path = ''
     # loadParameters(encoder, decoder, checkpoint_path)
 
-    checkpoint = trainTestSplit(DEVICE, encoder, decoder, model, train_path, test_path, iters=2000, count_every=100)
+    checkpoint = trainTestSplit(DEVICE, encoder, decoder, model, train_path, test_path, iters=10000, count_every=1000)
     # save_path = 'simple_split_gru.pt'
     # saveModel(encoder, decoder, checkpoint, save_path) 
 

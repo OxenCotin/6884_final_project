@@ -8,13 +8,14 @@ import torch
 
 SOS_token = 0
 EOS_token = 1
+PAD_token = 2
 
 class Lang:
     def __init__(self, name):
         self.name = name
         self.word2index = {}
         self.word2count = {}
-        self.index2word = {0: "SOS", 1: "EOS"}
+        self.index2word = {0: "SOS", 1: "EOS", 2: "PAD"}
         self.n_words = 2  # Count SOS and EOS
 
     def addSentence(self, sentence):
